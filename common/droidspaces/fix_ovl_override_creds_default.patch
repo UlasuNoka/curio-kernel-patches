@@ -1,0 +1,21 @@
+diff --git a/fs/overlayfs/params.c b/fs/overlayfs/params.c
+index 75b7e99..e13baaf 100644
+--- a/fs/overlayfs/params.c
++++ b/fs/overlayfs/params.c
+@@ -716,6 +716,7 @@ int ovl_init_fs_context(struct fs_context *fc)
+ 	ofs->config.nfs_export		= ovl_nfs_export_def;
+ 	ofs->config.xino		= ovl_xino_def();
+ 	ofs->config.metacopy		= ovl_metacopy_def;
++	ofs->config.override_creds	= ovl_override_creds_def;
+ 
+ 	fc->s_fs_info		= ofs;
+ 	fc->fs_private		= ctx;
+@@ -1021,5 +1022,8 @@ int ovl_show_options(struct seq_file *m, struct dentry *dentry)
+ 	if (ofs->config.verity_mode != ovl_verity_mode_def())
+ 		seq_printf(m, ",verity=%s",
+ 			   ovl_verity_mode(&ofs->config));
++	if (ofs->config.override_creds != ovl_override_creds_def)
++		seq_printf(m, ",override_creds=%s",
++			   ofs->config.override_creds ? "on" : "off");
+ 	return 0;
+ }
