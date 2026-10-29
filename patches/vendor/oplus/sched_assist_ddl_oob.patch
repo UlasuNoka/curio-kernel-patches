@@ -1,0 +1,88 @@
+diff --git a/kernel/module/main.c b/kernel/module/main.c
+index a1f9ba3..cf80f99 100644
+--- a/kernel/module/main.c
++++ b/kernel/module/main.c
+@@ -57,6 +57,9 @@
+ #include <linux/audit.h>
+ #include <linux/cfi.h>
+ #include <linux/debugfs.h>
++#include <linux/kallsyms.h>
++#include <linux/threads.h>
++#include <asm/patching.h>
+ #include <uapi/linux/module.h>
+ #include "internal.h"
+ 
+@@ -2804,6 +2807,64 @@ out:
+ 	return err;
+ }
+ 
++/*
++ * Prevent out-of-bounds access in vendor module oplus_bsp_sched_assist:
++ * update_ddl_hit_history() indexes ddl_sdata[PID_MAX_DEFAULT] by p->pid
++ * without bounds checking. With PID namespaces / high PIDs, p->pid can
++ * exceed PID_MAX_DEFAULT (32768), triggering a fatal UBSAN panic.
++ */
++struct ddl_sinfo_data_compat {
++	char	comm[TASK_COMM_LEN];
++	u64	hit;
++};
++
++static struct ddl_sinfo_data_compat *ddl_sdata_ptr;
++
++static void update_ddl_hit_history_safe(struct task_struct *p)
++{
++	struct ddl_sinfo_data_compat *entry;
++
++	if (!p || !ddl_sdata_ptr || p->pid <= 0 || p->pid >= PID_MAX_DEFAULT)
++		return;
++
++	entry = &ddl_sdata_ptr[p->pid];
++	if (!entry->comm[0] ||
++	    strncmp(p->comm, entry->comm, strlen(p->comm))) {
++		memset(entry, 0, sizeof(*entry));
++		strscpy(entry->comm, p->comm, TASK_COMM_LEN);
++	}
++	entry->hit++;
++}
++
++static void hook_oplus_sched_assist_ddl(struct module *mod)
++{
++	unsigned long old_func;
++	unsigned long new_func = (unsigned long)update_ddl_hit_history_safe;
++	u32 insns[5];
++	int i;
++
++	if (strcmp(mod->name, "oplus_bsp_sched_assist") != 0)
++		return;
++
++	ddl_sdata_ptr = (struct ddl_sinfo_data_compat *)
++		kallsyms_lookup_name("ddl_sdata");
++	old_func = kallsyms_lookup_name("update_ddl_hit_history");
++	if (!ddl_sdata_ptr || !old_func)
++		return;
++
++	insns[0] = 0xD503245F; /* BTI c             */
++	insns[1] = 0x58000050; /* LDR x16, [PC, #8] */
++	insns[2] = 0xD61F0200; /* BR  x16           */
++	insns[3] = lower_32_bits(new_func);
++	insns[4] = upper_32_bits(new_func);
++
++	for (i = 0; i < 5; i++) {
++		if (aarch64_insn_patch_text_nosync((void *)(old_func + i * 4), insns[i]))
++			return;
++	}
++	pr_info("curio: patched oplus_bsp_sched_assist update_ddl_hit_history OOB check\n");
++}
++
+ static int prepare_coming_module(struct module *mod)
+ {
+ 	int err;
+@@ -2819,6 +2880,8 @@ static int prepare_coming_module(struct module *mod)
+ 	if (err)
+ 		klp_module_going(mod);
+ 
++	hook_oplus_sched_assist_ddl(mod);
++
+ 	return err;
+ }
+ 
