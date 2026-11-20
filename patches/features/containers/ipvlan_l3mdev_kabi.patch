@@ -1,0 +1,401 @@
+diff --git a/drivers/net/ipvlan/ipvlan_l3s.c b/drivers/net/ipvlan/ipvlan_l3s.c
+index ca35a50..a2d4e61 100644
+--- a/drivers/net/ipvlan/ipvlan_l3s.c
++++ b/drivers/net/ipvlan/ipvlan_l3s.c
+@@ -209,7 +209,7 @@ int ipvlan_l3s_register(struct ipvl_port *port)
+ 
+ 	ret = ipvlan_register_nf_hook(read_pnet(&port->pnet));
+ 	if (!ret) {
+-		dev->l3mdev_ops = &ipvl_l3mdev_ops;
++		netdev_set_l3mdev_ops(dev, &ipvl_l3mdev_ops);
+ 		dev->priv_flags |= IFF_L3MDEV_RX_HANDLER;
+ 	}
+ 
+diff --git a/drivers/net/vrf.c b/drivers/net/vrf.c
+index 64114e9..d87ffd0 100644
+--- a/drivers/net/vrf.c
++++ b/drivers/net/vrf.c
+@@ -1652,7 +1652,7 @@ static void vrf_setup(struct net_device *dev)
+ 
+ 	/* Initialize the device structure. */
+ 	dev->netdev_ops = &vrf_netdev_ops;
+-	dev->l3mdev_ops = &vrf_l3mdev_ops;
++	netdev_set_l3mdev_ops(dev, &vrf_l3mdev_ops);
+ 	dev->ethtool_ops = &vrf_ethtool_ops;
+ 	dev->needs_free_netdev = true;
+ 
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index 08c3dc7..2708844 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -2170,9 +2170,6 @@ struct net_device {
+ 	const struct iw_handler_def *wireless_handlers;
+ 	struct iw_public_data	*wireless_data;
+ 	const struct ethtool_ops *ethtool_ops;
+-#ifdef CONFIG_NET_L3_MASTER_DEV
+-	const struct l3mdev_ops	*l3mdev_ops;
+-#endif
+ #if IS_ENABLED(CONFIG_IPV6)
+ 	const struct ndisc_ops *ndisc_ops;
+ #endif
+@@ -2454,6 +2451,31 @@ struct net_device {
+ };
+ #define to_net_dev(d) container_of(d, struct net_device, dev)
+ 
++/*
++ * Private allocation prefix before struct net_device to preserve KMI
++ * when CONFIG_NET_L3_MASTER_DEV is enabled on a kernel frozen with it off.
++ */
++#ifdef CONFIG_NET_L3_MASTER_DEV
++struct netdev_l3mdev_kabi {
++	const struct l3mdev_ops *l3mdev_ops;
++};
++#define NETDEV_L3MDEV_KABI_SIZE NETDEV_ALIGN
++
++static inline const struct l3mdev_ops *
++netdev_l3mdev_ops(const struct net_device *dev)
++{
++	return (((const struct netdev_l3mdev_kabi *)dev) - 1)->l3mdev_ops;
++}
++
++static inline void
++netdev_set_l3mdev_ops(struct net_device *dev, const struct l3mdev_ops *ops)
++{
++	(((struct netdev_l3mdev_kabi *)dev) - 1)->l3mdev_ops = ops;
++}
++#else
++#define NETDEV_L3MDEV_KABI_SIZE 0
++#endif
++
+ /*
+  * Driver should use this to assign devlink port instance to a netdevice
+  * before it registers the netdevice. Therefore devlink_port is static
+diff --git a/include/net/inet_sock.h b/include/net/inet_sock.h
+index eace670..aa5cf99 100644
+--- a/include/net/inet_sock.h
++++ b/include/net/inet_sock.h
+@@ -123,7 +123,7 @@ static inline int inet_request_bound_dev_if(const struct sock *sk,
+ #ifdef CONFIG_NET_L3_MASTER_DEV
+ 	struct net *net = sock_net(sk);
+ 
+-	if (!bound_dev_if && READ_ONCE(net->ipv4.sysctl_tcp_l3mdev_accept))
++	if (!bound_dev_if && READ_ONCE(net_l3mdev(net)->sysctl_tcp_l3mdev_accept))
+ 		return l3mdev_master_ifindex_by_index(net, skb->skb_iif);
+ #endif
+ 
+@@ -135,7 +135,7 @@ static inline int inet_sk_bound_l3mdev(const struct sock *sk)
+ #ifdef CONFIG_NET_L3_MASTER_DEV
+ 	struct net *net = sock_net(sk);
+ 
+-	if (!READ_ONCE(net->ipv4.sysctl_tcp_l3mdev_accept))
++	if (!READ_ONCE(net_l3mdev(net)->sysctl_tcp_l3mdev_accept))
+ 		return l3mdev_master_ifindex_by_index(net,
+ 						      sk->sk_bound_dev_if);
+ #endif
+@@ -155,7 +155,7 @@ static inline bool inet_sk_bound_dev_eq(struct net *net, int bound_dev_if,
+ 					int dif, int sdif)
+ {
+ #if IS_ENABLED(CONFIG_NET_L3_MASTER_DEV)
+-	return inet_bound_dev_eq(!!READ_ONCE(net->ipv4.sysctl_tcp_l3mdev_accept),
++	return inet_bound_dev_eq(!!READ_ONCE(net_l3mdev(net)->sysctl_tcp_l3mdev_accept),
+ 				 bound_dev_if, dif, sdif);
+ #else
+ 	return inet_bound_dev_eq(true, bound_dev_if, dif, sdif);
+diff --git a/include/net/l3mdev.h b/include/net/l3mdev.h
+index bdfa9d4..850fa2e 100644
+--- a/include/net/l3mdev.h
++++ b/include/net/l3mdev.h
+@@ -172,8 +172,8 @@ struct sk_buff *l3mdev_l3_rcv(struct sk_buff *skb, u16 proto)
+ 		 netif_has_l3_rx_handler(skb->dev))
+ 		master = skb->dev;
+ 
+-	if (master && master->l3mdev_ops->l3mdev_l3_rcv)
+-		skb = master->l3mdev_ops->l3mdev_l3_rcv(master, skb, proto);
++	if (master && netdev_l3mdev_ops(master)->l3mdev_l3_rcv)
++		skb = netdev_l3mdev_ops(master)->l3mdev_l3_rcv(master, skb, proto);
+ 
+ 	return skb;
+ }
+@@ -200,8 +200,8 @@ struct sk_buff *l3mdev_l3_out(struct sock *sk, struct sk_buff *skb, u16 proto)
+ 
+ 		rcu_read_lock();
+ 		master = netdev_master_upper_dev_get_rcu(dev);
+-		if (master && master->l3mdev_ops->l3mdev_l3_out)
+-			skb = master->l3mdev_ops->l3mdev_l3_out(master, sk,
++		if (master && netdev_l3mdev_ops(master)->l3mdev_l3_out)
++			skb = netdev_l3mdev_ops(master)->l3mdev_l3_out(master, sk,
+ 								skb, proto);
+ 		rcu_read_unlock();
+ 	}
+diff --git a/include/net/net_namespace.h b/include/net/net_namespace.h
+index aef1c7d..9b00daf 100644
+--- a/include/net/net_namespace.h
++++ b/include/net/net_namespace.h
+@@ -197,6 +197,28 @@ struct net {
+ /* Init's network namespace */
+ extern struct net init_net;
+ 
++/*
++ * Private SLUB tail after struct net to preserve KMI layout when
++ * CONFIG_NET_L3_MASTER_DEV is enabled.
++ */
++struct net_allocation {
++	struct net net;
++#ifdef CONFIG_NET_L3_MASTER_DEV
++	struct net_l3mdev_kabi l3mdev;
++#endif
++};
++
++#ifdef CONFIG_NET_L3_MASTER_DEV
++extern struct net_l3mdev_kabi init_net_l3mdev;
++
++static inline struct net_l3mdev_kabi *net_l3mdev(const struct net *net)
++{
++	if (net == &init_net)
++		return &init_net_l3mdev;
++	return &container_of((struct net *)net, struct net_allocation, net)->l3mdev;
++}
++#endif
++
+ #ifdef CONFIG_NET_NS
+ struct net *copy_net_ns(unsigned long flags, struct user_namespace *user_ns,
+ 			struct net *old_net);
+diff --git a/include/net/netns/ipv4.h b/include/net/netns/ipv4.h
+index 68bde6b..c334b07 100644
+--- a/include/net/netns/ipv4.h
++++ b/include/net/netns/ipv4.h
+@@ -104,9 +104,6 @@ struct netns_ipv4 {
+ 	/* Shall we try to damage output packets if routing dev changes? */
+ 	u8 sysctl_ip_dynaddr;
+ 	u8 sysctl_ip_early_demux;
+-#ifdef CONFIG_NET_L3_MASTER_DEV
+-	u8 sysctl_raw_l3mdev_accept;
+-#endif
+ 	u8 sysctl_tcp_early_demux;
+ 	u8 sysctl_udp_early_demux;
+ 
+@@ -114,9 +111,6 @@ struct netns_ipv4 {
+ 
+ 	u8 sysctl_fwmark_reflect;
+ 	u8 sysctl_tcp_fwmark_accept;
+-#ifdef CONFIG_NET_L3_MASTER_DEV
+-	u8 sysctl_tcp_l3mdev_accept;
+-#endif
+ 	u8 sysctl_tcp_mtu_probing;
+ 	int sysctl_tcp_mtu_probe_floor;
+ 	int sysctl_tcp_base_mss;
+@@ -198,9 +192,6 @@ struct netns_ipv4 {
+ 	u8 sysctl_fib_notify_on_flag_change;
+ 	u8 sysctl_tcp_syn_linear_timeouts;
+ 
+-#ifdef CONFIG_NET_L3_MASTER_DEV
+-	u8 sysctl_udp_l3mdev_accept;
+-#endif
+ 
+ 	u8 sysctl_igmp_llm_reports;
+ 	int sysctl_igmp_max_memberships;
+@@ -243,4 +234,12 @@ struct netns_ipv4 {
+ 
+ 	ANDROID_KABI_RESERVE(1);
+ };
++
++#ifdef CONFIG_NET_L3_MASTER_DEV
++struct net_l3mdev_kabi {
++	u8 sysctl_raw_l3mdev_accept;
++	u8 sysctl_tcp_l3mdev_accept;
++	u8 sysctl_udp_l3mdev_accept;
++};
++#endif
+ #endif
+diff --git a/include/net/raw.h b/include/net/raw.h
+index 32a6148..0cd96ca 100644
+--- a/include/net/raw.h
++++ b/include/net/raw.h
+@@ -89,7 +89,7 @@ static inline bool raw_sk_bound_dev_eq(struct net *net, int bound_dev_if,
+ 				       int dif, int sdif)
+ {
+ #if IS_ENABLED(CONFIG_NET_L3_MASTER_DEV)
+-	return inet_bound_dev_eq(READ_ONCE(net->ipv4.sysctl_raw_l3mdev_accept),
++	return inet_bound_dev_eq(READ_ONCE(net_l3mdev(net)->sysctl_raw_l3mdev_accept),
+ 				 bound_dev_if, dif, sdif);
+ #else
+ 	return inet_bound_dev_eq(true, bound_dev_if, dif, sdif);
+diff --git a/include/net/udp.h b/include/net/udp.h
+index 89eeb18..8befc78 100644
+--- a/include/net/udp.h
++++ b/include/net/udp.h
+@@ -249,7 +249,7 @@ static inline bool udp_sk_bound_dev_eq(struct net *net, int bound_dev_if,
+ 				       int dif, int sdif)
+ {
+ #if IS_ENABLED(CONFIG_NET_L3_MASTER_DEV)
+-	return inet_bound_dev_eq(!!READ_ONCE(net->ipv4.sysctl_udp_l3mdev_accept),
++	return inet_bound_dev_eq(!!READ_ONCE(net_l3mdev(net)->sysctl_udp_l3mdev_accept),
+ 				 bound_dev_if, dif, sdif);
+ #else
+ 	return inet_bound_dev_eq(true, bound_dev_if, dif, sdif);
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 975513f..ea25a9c 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -10840,13 +10840,13 @@ struct net_device *alloc_netdev_mqs(int sizeof_priv, const char *name,
+ 		alloc_size += sizeof_priv;
+ 	}
+ 	/* ensure 32-byte alignment of whole construct */
+-	alloc_size += NETDEV_ALIGN - 1;
++	alloc_size += NETDEV_L3MDEV_KABI_SIZE + NETDEV_ALIGN - 1;
+ 
+ 	p = kvzalloc(alloc_size, GFP_KERNEL_ACCOUNT | __GFP_RETRY_MAYFAIL);
+ 	if (!p)
+ 		return NULL;
+ 
+-	dev = PTR_ALIGN(p, NETDEV_ALIGN);
++	dev = (struct net_device *)PTR_ALIGN((char *)p + NETDEV_L3MDEV_KABI_SIZE, NETDEV_ALIGN);
+ 	dev->padded = (char *)dev - (char *)p;
+ 
+ 	ref_tracker_dir_init(&dev->refcnt_tracker, 128, name);
+diff --git a/net/core/net_namespace.c b/net/core/net_namespace.c
+index 372db9e..494b7b3 100644
+--- a/net/core/net_namespace.c
++++ b/net/core/net_namespace.c
+@@ -47,6 +47,10 @@ static struct key_tag init_net_key_domain = { .usage = REFCOUNT_INIT(1) };
+ 
+ struct net init_net;
+ EXPORT_SYMBOL(init_net);
++#ifdef CONFIG_NET_L3_MASTER_DEV
++struct net_l3mdev_kabi init_net_l3mdev;
++EXPORT_SYMBOL(init_net_l3mdev);
++#endif
+ 
+ static bool init_net_initialized;
+ /*
+@@ -1112,7 +1116,7 @@ void __init net_ns_init(void)
+ 	struct net_generic *ng;
+ 
+ #ifdef CONFIG_NET_NS
+-	net_cachep = kmem_cache_create("net_namespace", sizeof(struct net),
++	net_cachep = kmem_cache_create("net_namespace", sizeof(struct net_allocation),
+ 					SMP_CACHE_BYTES,
+ 					SLAB_PANIC|SLAB_ACCOUNT, NULL);
+ 
+diff --git a/net/ipv4/raw.c b/net/ipv4/raw.c
+index 39834b9..8780441 100644
+--- a/net/ipv4/raw.c
++++ b/net/ipv4/raw.c
+@@ -1092,7 +1092,7 @@ void __init raw_proc_exit(void)
+ static void raw_sysctl_init_net(struct net *net)
+ {
+ #ifdef CONFIG_NET_L3_MASTER_DEV
+-	net->ipv4.sysctl_raw_l3mdev_accept = 1;
++	net_l3mdev(net)->sysctl_raw_l3mdev_accept = 1;
+ #endif
+ }
+ 
+diff --git a/net/ipv4/sysctl_net_ipv4.c b/net/ipv4/sysctl_net_ipv4.c
+index 6ac890b..d247b06 100644
+--- a/net/ipv4/sysctl_net_ipv4.c
++++ b/net/ipv4/sysctl_net_ipv4.c
+@@ -659,7 +659,7 @@ static struct ctl_table ipv4_net_table[] = {
+ #ifdef CONFIG_NET_L3_MASTER_DEV
+ 	{
+ 		.procname	= "raw_l3mdev_accept",
+-		.data		= &init_net.ipv4.sysctl_raw_l3mdev_accept,
++		.data		= &init_net_l3mdev.sysctl_raw_l3mdev_accept,
+ 		.maxlen		= sizeof(u8),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dou8vec_minmax,
+@@ -801,7 +801,7 @@ static struct ctl_table ipv4_net_table[] = {
+ #ifdef CONFIG_NET_L3_MASTER_DEV
+ 	{
+ 		.procname	= "tcp_l3mdev_accept",
+-		.data		= &init_net.ipv4.sysctl_tcp_l3mdev_accept,
++		.data		= &init_net_l3mdev.sysctl_tcp_l3mdev_accept,
+ 		.maxlen		= sizeof(u8),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dou8vec_minmax,
+@@ -1086,7 +1086,7 @@ static struct ctl_table ipv4_net_table[] = {
+ #ifdef CONFIG_NET_L3_MASTER_DEV
+ 	{
+ 		.procname	= "udp_l3mdev_accept",
+-		.data		= &init_net.ipv4.sysctl_udp_l3mdev_accept,
++		.data		= &init_net_l3mdev.sysctl_udp_l3mdev_accept,
+ 		.maxlen		= sizeof(u8),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dou8vec_minmax,
+@@ -1509,7 +1509,15 @@ static __net_init int ipv4_sysctl_init_net(struct net *net)
+ 				/* Update the variables to point into
+ 				 * the current struct net
+ 				 */
+-				table[i].data += (void *)net - (void *)&init_net;
++				{
++#ifdef CONFIG_NET_L3_MASTER_DEV
++					if (table[i].data >= (void *)&init_net_l3mdev &&
++					    table[i].data < (void *)(&init_net_l3mdev + 1))
++						table[i].data += (void *)net_l3mdev(net) - (void *)&init_net_l3mdev;
++					else
++#endif
++						table[i].data += (void *)net - (void *)&init_net;
++				}
+ 			} else {
+ 				/* Entries without data pointer are global;
+ 				 * Make them read-only in non-init_net ns
+diff --git a/net/ipv4/udp.c b/net/ipv4/udp.c
+index 137a7ba..52d7e93 100644
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@ -3462,7 +3462,7 @@ static void __net_init udp_sysctl_init(struct net *net)
+ 	net->ipv4.sysctl_udp_wmem_min = PAGE_SIZE;
+ 
+ #ifdef CONFIG_NET_L3_MASTER_DEV
+-	net->ipv4.sysctl_udp_l3mdev_accept = 0;
++	net_l3mdev(net)->sysctl_udp_l3mdev_accept = 0;
+ #endif
+ }
+ 
+diff --git a/net/l3mdev/l3mdev.c b/net/l3mdev/l3mdev.c
+index ca10916..f80822d 100644
+--- a/net/l3mdev/l3mdev.c
++++ b/net/l3mdev/l3mdev.c
+@@ -167,8 +167,8 @@ u32 l3mdev_fib_table_rcu(const struct net_device *dev)
+ 		return 0;
+ 
+ 	if (netif_is_l3_master(dev)) {
+-		if (dev->l3mdev_ops->l3mdev_fib_table)
+-			tb_id = dev->l3mdev_ops->l3mdev_fib_table(dev);
++		if (netdev_l3mdev_ops(dev)->l3mdev_fib_table)
++			tb_id = netdev_l3mdev_ops(dev)->l3mdev_fib_table(dev);
+ 	} else if (netif_is_l3_slave(dev)) {
+ 		/* Users of netdev_master_upper_dev_get_rcu need non-const,
+ 		 * but current inet_*type functions take a const
+@@ -178,8 +178,8 @@ u32 l3mdev_fib_table_rcu(const struct net_device *dev)
+ 
+ 		master = netdev_master_upper_dev_get_rcu(_dev);
+ 		if (master &&
+-		    master->l3mdev_ops->l3mdev_fib_table)
+-			tb_id = master->l3mdev_ops->l3mdev_fib_table(master);
++		    netdev_l3mdev_ops(master)->l3mdev_fib_table)
++			tb_id = netdev_l3mdev_ops(master)->l3mdev_fib_table(master);
+ 	}
+ 
+ 	return tb_id;
+@@ -228,8 +228,8 @@ struct dst_entry *l3mdev_link_scope_lookup(struct net *net,
+ 			dev = netdev_master_upper_dev_get_rcu(dev);
+ 
+ 		if (dev && netif_is_l3_master(dev) &&
+-		    dev->l3mdev_ops->l3mdev_link_scope_lookup)
+-			dst = dev->l3mdev_ops->l3mdev_link_scope_lookup(dev, fl6);
++		    netdev_l3mdev_ops(dev)->l3mdev_link_scope_lookup)
++			dst = netdev_l3mdev_ops(dev)->l3mdev_link_scope_lookup(dev, fl6);
+ 	}
+ 
+ 	return dst;
+@@ -258,8 +258,8 @@ int l3mdev_fib_rule_match(struct net *net, struct flowi *fl,
+ 
+ 	dev = dev_get_by_index_rcu(net, fl->flowi_l3mdev);
+ 	if (dev && netif_is_l3_master(dev) &&
+-	    dev->l3mdev_ops->l3mdev_fib_table) {
+-		arg->table = dev->l3mdev_ops->l3mdev_fib_table(dev);
++	    netdev_l3mdev_ops(dev)->l3mdev_fib_table) {
++		arg->table = netdev_l3mdev_ops(dev)->l3mdev_fib_table(dev);
+ 		rc = 1;
+ 	}
+ 
