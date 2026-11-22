@@ -1,0 +1,256 @@
+diff --git a/drivers/misc/Kconfig b/drivers/misc/Kconfig
+index 68aee8d..f8434e7 100644
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -596,4 +596,14 @@ source "drivers/misc/cardreader/Kconfig"
+ source "drivers/misc/uacce/Kconfig"
+ source "drivers/misc/pvpanic/Kconfig"
+ source "drivers/misc/mchp_pci1xxxx/Kconfig"
++config USB_SDP_CURRENT_LIMIT
++	bool "Raise USB SDP input current limit to 900 mA on OPLUS devices"
++	depends on OF && PROC_FS
++	default y
++	help
++	  Updates OPLUS charger device-tree power tables at early_initcall time
++	  to allow up to 900 mA (4500 mW at 5 V) on USB Standard Downstream
++	  Ports (SDP) while preserving runtime toggle support via
++	  /proc/usb_sdp_limit.
++
+ endmenu
+diff --git a/drivers/misc/Makefile b/drivers/misc/Makefile
+index 1c8873f..714e19a 100644
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -69,3 +69,4 @@ obj-$(CONFIG_TPS6594_ESM)	+= tps6594-esm.o
+ obj-$(CONFIG_TPS6594_PFSM)	+= tps6594-pfsm.o
+ obj-$(CONFIG_UID_SYS_STATS)	+= uid_sys_stats.o
+ obj-$(CONFIG_PKVM_SMC_FILTER)  += pkvm-smc/
++obj-$(CONFIG_USB_SDP_CURRENT_LIMIT)	+= usb_sdp_limit.o
+diff --git a/drivers/misc/usb_sdp_limit.c b/drivers/misc/usb_sdp_limit.c
+new file mode 100644
+index 0000000..0b89a32
+--- /dev/null
++++ b/drivers/misc/usb_sdp_limit.c
+@@ -0,0 +1,222 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Device-tree USB SDP current limit controller for OPLUS V1/V2 chargers.
++ */
++
++#define pr_fmt(fmt) "usb_sdp_limit: " fmt
++
++#include <asm/byteorder.h>
++#include <linux/fs.h>
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/kstrtox.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/proc_fs.h>
++#include <linux/seq_file.h>
++#include <linux/slab.h>
++
++#define V1_PROP_SDP		"qcom,input_current_usb_ma"
++#define V2_PROP_POWER		"oplus_spec,input-power-mw"
++#define V2_MODE_SDP		1
++#define V2_VBUS_MV		5000
++#define TARGET_SDP_MA		900
++#define TARGET_SDP_MW		(TARGET_SDP_MA * V2_VBUS_MV / 1000)
++#define MAX_TRACKED_SLOTS	12
++#define MAX_POWER_WORDS		32
++
++struct sdp_dt_slot {
++	struct device_node *np;
++	bool is_v2;
++	int words;
++	u32 orig_val;
++	u32 orig_array[MAX_POWER_WORDS];
++};
++
++static struct sdp_dt_slot slots[MAX_TRACKED_SLOTS];
++static int nr_slots;
++static bool sdp_boost_enabled = true;
++static DEFINE_MUTEX(sdp_lock);
++
++static int __init usb_sdp_limit_setup(char *str)
++{
++	sdp_boost_enabled = !(str && str[0] == '0');
++	return 1;
++}
++__setup("usb_sdp_limit=", usb_sdp_limit_setup);
++
++static int update_dt_prop_alloc(struct device_node *np, const char *name,
++				const void *val, int len)
++{
++	struct property *prop;
++	void *buf;
++
++	prop = kzalloc(sizeof(*prop), GFP_KERNEL);
++	if (!prop)
++		return -ENOMEM;
++
++	buf = kmemdup(val, len, GFP_KERNEL);
++	if (!buf) {
++		kfree(prop);
++		return -ENOMEM;
++	}
++
++	prop->name = (char *)name;
++	prop->length = len;
++	prop->value = buf;
++
++	return of_update_property(np, prop);
++}
++
++static int apply_slot_state(struct sdp_dt_slot *s, bool boost)
++{
++	__be32 tmp[MAX_POWER_WORDS];
++	int i;
++
++	if (s->is_v2) {
++		for (i = 0; i < s->words; i++)
++			tmp[i] = cpu_to_be32(s->orig_array[i]);
++		if (boost && s->orig_val < TARGET_SDP_MW)
++			tmp[V2_MODE_SDP] = cpu_to_be32(TARGET_SDP_MW);
++		return update_dt_prop_alloc(s->np, V2_PROP_POWER,
++					    tmp, s->words * sizeof(u32));
++	}
++
++	tmp[0] = cpu_to_be32((boost && s->orig_val < TARGET_SDP_MA) ?
++			     TARGET_SDP_MA : s->orig_val);
++	return update_dt_prop_alloc(s->np, V1_PROP_SDP, tmp, sizeof(u32));
++}
++
++static void __init discover_and_apply(void)
++{
++	struct device_node *np;
++	struct property *pp;
++
++	for_each_node_with_property(np, V2_PROP_POWER) {
++		int words, i;
++
++		if (nr_slots >= MAX_TRACKED_SLOTS)
++			break;
++		pp = of_find_property(np, V2_PROP_POWER, NULL);
++		if (!pp)
++			continue;
++		words = pp->length / sizeof(u32);
++		if (words <= V2_MODE_SDP || words > MAX_POWER_WORDS)
++			continue;
++
++		slots[nr_slots].np = of_node_get(np);
++		slots[nr_slots].is_v2 = true;
++		slots[nr_slots].words = words;
++		for (i = 0; i < words; i++)
++			slots[nr_slots].orig_array[i] =
++				be32_to_cpu(((__be32 *)pp->value)[i]);
++		slots[nr_slots].orig_val = slots[nr_slots].orig_array[V2_MODE_SDP];
++
++		if (sdp_boost_enabled && slots[nr_slots].orig_val > 0 &&
++		    slots[nr_slots].orig_val < TARGET_SDP_MW) {
++			if (!apply_slot_state(&slots[nr_slots], true))
++				pr_info("V2 %pOF: SDP %u -> %u mW (%u mA)\n",
++					np, slots[nr_slots].orig_val,
++					TARGET_SDP_MW, TARGET_SDP_MA);
++		}
++		nr_slots++;
++	}
++
++	for_each_node_with_property(np, V1_PROP_SDP) {
++		u32 val = 0;
++
++		if (nr_slots >= MAX_TRACKED_SLOTS)
++			break;
++		if (of_property_read_u32(np, V1_PROP_SDP, &val) || !val)
++			continue;
++
++		slots[nr_slots].np = of_node_get(np);
++		slots[nr_slots].is_v2 = false;
++		slots[nr_slots].words = 1;
++		slots[nr_slots].orig_val = val;
++
++		if (sdp_boost_enabled && val < TARGET_SDP_MA) {
++			if (!apply_slot_state(&slots[nr_slots], true))
++				pr_info("V1 %pOF: SDP %u -> %u mA\n",
++					np, val, TARGET_SDP_MA);
++		}
++		nr_slots++;
++	}
++}
++
++static int usb_sdp_limit_show(struct seq_file *m, void *v)
++{
++	int i;
++
++	mutex_lock(&sdp_lock);
++	seq_printf(m, "enabled=%d target=%u mA (%u mW)\n",
++		   sdp_boost_enabled ? 1 : 0, TARGET_SDP_MA, TARGET_SDP_MW);
++	for (i = 0; i < nr_slots; i++) {
++		struct sdp_dt_slot *s = &slots[i];
++		u32 cur = 0;
++
++		if (s->is_v2) {
++			of_property_read_u32_index(s->np, V2_PROP_POWER,
++						   V2_MODE_SDP, &cur);
++			seq_printf(m, "V2 %pOF: %u mW (%u mA) [stock=%u mW]\n",
++				   s->np, cur, cur * 1000 / V2_VBUS_MV, s->orig_val);
++		} else {
++			of_property_read_u32(s->np, V1_PROP_SDP, &cur);
++			seq_printf(m, "V1 %pOF: %u mA [stock=%u mA]\n",
++				   s->np, cur, s->orig_val);
++		}
++	}
++	mutex_unlock(&sdp_lock);
++	return 0;
++}
++
++static int usb_sdp_limit_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, usb_sdp_limit_show, NULL);
++}
++
++static ssize_t usb_sdp_limit_write(struct file *file, const char __user *ubuf,
++				   size_t count, loff_t *ppos)
++{
++	bool enable;
++	int ret, i;
++
++	ret = kstrtobool_from_user(ubuf, count, &enable);
++	if (ret)
++		return ret;
++
++	mutex_lock(&sdp_lock);
++	if (sdp_boost_enabled != enable) {
++		sdp_boost_enabled = enable;
++		for (i = 0; i < nr_slots; i++)
++			apply_slot_state(&slots[i], enable);
++	}
++	mutex_unlock(&sdp_lock);
++	return count;
++}
++
++static const struct proc_ops usb_sdp_limit_proc_ops = {
++	.proc_open	= usb_sdp_limit_open,
++	.proc_read	= seq_read,
++	.proc_write	= usb_sdp_limit_write,
++	.proc_lseek	= seq_lseek,
++	.proc_release	= single_release,
++};
++
++static int __init usb_sdp_limit_proc_init(void)
++{
++	proc_create("usb_sdp_limit", 0644, NULL, &usb_sdp_limit_proc_ops);
++	return 0;
++}
++late_initcall(usb_sdp_limit_proc_init);
++
++static int __init usb_sdp_limit_init(void)
++{
++	discover_and_apply();
++	return 0;
++}
++early_initcall(usb_sdp_limit_init);
++
++MODULE_DESCRIPTION("OPLUS USB SDP 900 mA input current limit controller");
++MODULE_LICENSE("GPL");
