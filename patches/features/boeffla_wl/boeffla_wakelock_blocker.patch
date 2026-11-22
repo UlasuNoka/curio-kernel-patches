@@ -1,0 +1,282 @@
+diff --git a/drivers/base/power/boeffla_wl_blocker.h b/drivers/base/power/boeffla_wl_blocker.h
+new file mode 100644
+index 0000000..1290854
+--- /dev/null
++++ b/drivers/base/power/boeffla_wl_blocker.h
+@@ -0,0 +1,6 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#define BOEFFLA_WL_BLOCKER_VERSION	"1.1.0"
++#define LIST_WL_DEFAULT			"qcom_rx_wakelock;wlan;wlan_wow_wl;wlan_extscan_wl;netmgr_wl;NETLINK;ipa_ws;[timerfd];wlan_ipa;wlan_pno_wl;wcnss_filter_lock;"
++#define LENGTH_LIST_WL			255
++#define LENGTH_LIST_WL_DEFAULT		125
++#define LENGTH_LIST_WL_SEARCH		(LENGTH_LIST_WL + LENGTH_LIST_WL_DEFAULT + 5)
+diff --git a/drivers/base/power/wakeup.c b/drivers/base/power/wakeup.c
+index 0b997d3..4160410 100644
+--- a/drivers/base/power/wakeup.c
++++ b/drivers/base/power/wakeup.c
+@@ -19,6 +19,28 @@
+ #include <linux/irqdesc.h>
+ #include <linux/wakeup_reason.h>
+ #include <trace/events/power.h>
++#include <linux/miscdevice.h>
++#include <linux/mutex.h>
++#include <linux/rcupdate.h>
++#include "boeffla_wl_blocker.h"
++
++/*
++ * check_for_block() runs from hard IRQ in wakeup_source_activate();
++ * sysfs writers serialize under wl_blocker_lock and swap RCU snapshots.
++ */
++struct wl_blocker_entry {
++	struct rcu_head rcu;
++	bool active;
++	char search[LENGTH_LIST_WL_SEARCH];
++};
++
++static DEFINE_MUTEX(wl_blocker_lock);
++static char list_wl[LENGTH_LIST_WL];
++static char list_wl_default[LENGTH_LIST_WL_DEFAULT];
++static struct wl_blocker_entry __rcu *wl_blocker_cur;
++static bool wl_blocker_debug;
++static void wakeup_source_deactivate(struct wakeup_source *ws);
++static bool check_for_block(struct wakeup_source *ws);
+ 
+ #include "power.h"
+ 
+@@ -576,6 +598,10 @@ static void wakeup_source_activate(struct wakeup_source *ws)
+ 	cec = atomic_inc_return(&combined_event_count);
+ 
+ 	trace_wakeup_source_activate(ws->name, cec);
++	if (check_for_block(ws)) {
++		wakeup_source_deactivate(ws);
++		return;
++	}
+ }
+ 
+ /**
+@@ -1234,3 +1260,225 @@ static int __init wakeup_sources_debugfs_init(void)
+ }
+ 
+ postcore_initcall(wakeup_sources_debugfs_init);
++
++static int publish_search_list_locked(const char *def_list, const char *usr_list)
++{
++	struct wl_blocker_entry *next, *old;
++	int len;
++
++	next = kmalloc(sizeof(*next), GFP_KERNEL);
++	if (!next)
++		return -ENOMEM;
++
++	len = snprintf(next->search, sizeof(next->search), ";%s;%s;",
++		       def_list, usr_list);
++	next->active = (len > 3);
++
++	old = rcu_dereference_protected(wl_blocker_cur,
++					lockdep_is_held(&wl_blocker_lock));
++	rcu_assign_pointer(wl_blocker_cur, next);
++	if (old)
++		kfree_rcu(old, rcu);
++	return 0;
++}
++
++static bool check_for_block(struct wakeup_source *ws)
++{
++	struct wl_blocker_entry *entry;
++	char wl_name[64];
++	bool blocked = false;
++
++	if (!ws || !ws->name)
++		return false;
++
++	rcu_read_lock();
++	entry = rcu_dereference(wl_blocker_cur);
++	if (entry && entry->active) {
++		snprintf(wl_name, sizeof(wl_name), ";%s;", ws->name);
++		if (strstr(entry->search, wl_name)) {
++			if (READ_ONCE(wl_blocker_debug))
++				pr_info("Boeffla WL blocker: %s blocked\n",
++					ws->name);
++			blocked = true;
++		}
++	}
++	rcu_read_unlock();
++	return blocked;
++}
++
++static ssize_t wakelock_blocker_show(struct device *dev,
++				     struct device_attribute *attr, char *buf)
++{
++	ssize_t ret;
++
++	mutex_lock(&wl_blocker_lock);
++	ret = sysfs_emit(buf, "%s\n", list_wl);
++	mutex_unlock(&wl_blocker_lock);
++	return ret;
++}
++
++static ssize_t wakelock_blocker_store(struct device *dev,
++				      struct device_attribute *attr,
++				      const char *buf, size_t n)
++{
++	char tmp[LENGTH_LIST_WL];
++	size_t len = n;
++	int ret;
++
++	if (len > 0 && buf[len - 1] == '\n')
++		len--;
++	if (len >= sizeof(tmp))
++		return -EINVAL;
++
++	memcpy(tmp, buf, len);
++	tmp[len] = '\0';
++
++	mutex_lock(&wl_blocker_lock);
++	ret = publish_search_list_locked(list_wl_default, tmp);
++	if (!ret)
++		memcpy(list_wl, tmp, len + 1);
++	mutex_unlock(&wl_blocker_lock);
++	return ret ? ret : n;
++}
++
++static ssize_t wakelock_blocker_default_show(struct device *dev,
++					     struct device_attribute *attr,
++					     char *buf)
++{
++	ssize_t ret;
++
++	mutex_lock(&wl_blocker_lock);
++	ret = sysfs_emit(buf, "%s\n", list_wl_default);
++	mutex_unlock(&wl_blocker_lock);
++	return ret;
++}
++
++static ssize_t wakelock_blocker_default_store(struct device *dev,
++					      struct device_attribute *attr,
++					      const char *buf, size_t n)
++{
++	char tmp[LENGTH_LIST_WL_DEFAULT];
++	size_t len = n;
++	int ret;
++
++	if (len > 0 && buf[len - 1] == '\n')
++		len--;
++	if (len >= sizeof(tmp))
++		return -EINVAL;
++
++	memcpy(tmp, buf, len);
++	tmp[len] = '\0';
++
++	mutex_lock(&wl_blocker_lock);
++	ret = publish_search_list_locked(tmp, list_wl);
++	if (!ret)
++		memcpy(list_wl_default, tmp, len + 1);
++	mutex_unlock(&wl_blocker_lock);
++	return ret ? ret : n;
++}
++
++static ssize_t version_show(struct device *dev,
++			    struct device_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%s\n", BOEFFLA_WL_BLOCKER_VERSION);
++}
++
++static ssize_t debug_show(struct device *dev,
++			  struct device_attribute *attr, char *buf)
++{
++	struct wl_blocker_entry *entry;
++	ssize_t ret;
++
++	mutex_lock(&wl_blocker_lock);
++	entry = rcu_dereference_protected(wl_blocker_cur,
++					  lockdep_is_held(&wl_blocker_lock));
++	ret = sysfs_emit(buf,
++			 "Debug status: %d\n\nUser list: %s\nDefault list: %s\nSearch list: %s\nActive: %d\n",
++			 READ_ONCE(wl_blocker_debug), list_wl, list_wl_default,
++			 entry ? entry->search : "", entry ? entry->active : 0);
++	mutex_unlock(&wl_blocker_lock);
++	return ret;
++}
++
++static ssize_t debug_store(struct device *dev,
++			   struct device_attribute *attr,
++			   const char *buf, size_t n)
++{
++	bool val;
++
++	if (kstrtobool(buf, &val))
++		return -EINVAL;
++	WRITE_ONCE(wl_blocker_debug, val);
++	return n;
++}
++
++static DEVICE_ATTR_RW(wakelock_blocker);
++static DEVICE_ATTR_RW(wakelock_blocker_default);
++static DEVICE_ATTR_RO(version);
++static DEVICE_ATTR_RW(debug);
++
++static struct attribute *boeffla_wl_blocker_attrs[] = {
++	&dev_attr_wakelock_blocker.attr,
++	&dev_attr_wakelock_blocker_default.attr,
++	&dev_attr_version.attr,
++	&dev_attr_debug.attr,
++	NULL
++};
++
++static const struct attribute_group boeffla_wl_blocker_attr_group = {
++	.attrs = boeffla_wl_blocker_attrs,
++};
++
++static struct miscdevice boeffla_wl_blocker_device = {
++	.minor = MISC_DYNAMIC_MINOR,
++	.name = "boeffla_wakelock_blocker",
++};
++
++static void boeffla_wl_blocker_clear_locked(void)
++{
++	struct wl_blocker_entry *old;
++
++	old = rcu_dereference_protected(wl_blocker_cur,
++					lockdep_is_held(&wl_blocker_lock));
++	rcu_assign_pointer(wl_blocker_cur, NULL);
++	if (old)
++		kfree_rcu(old, rcu);
++}
++
++static int __init boeffla_wl_blocker_init(void)
++{
++	int ret;
++
++	mutex_lock(&wl_blocker_lock);
++	strscpy(list_wl_default, LIST_WL_DEFAULT, sizeof(list_wl_default));
++	ret = publish_search_list_locked(list_wl_default, list_wl);
++	mutex_unlock(&wl_blocker_lock);
++	if (ret)
++		return ret;
++
++	ret = misc_register(&boeffla_wl_blocker_device);
++	if (ret) {
++		pr_err("Boeffla WL blocker: misc_register failed (%d)\n", ret);
++		goto err_clear;
++	}
++
++	ret = sysfs_create_group(&boeffla_wl_blocker_device.this_device->kobj,
++				 &boeffla_wl_blocker_attr_group);
++	if (ret) {
++		pr_warn("Boeffla WL blocker: failed to create sysfs group (%d)\n",
++			ret);
++		misc_deregister(&boeffla_wl_blocker_device);
++		goto err_clear;
++	}
++
++	pr_info("Boeffla WL blocker: version %s started\n",
++		BOEFFLA_WL_BLOCKER_VERSION);
++	return 0;
++
++err_clear:
++	mutex_lock(&wl_blocker_lock);
++	boeffla_wl_blocker_clear_locked();
++	mutex_unlock(&wl_blocker_lock);
++	return ret;
++}
++late_initcall(boeffla_wl_blocker_init);
