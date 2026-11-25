@@ -2327,32 +2327,6 @@ index 58b6dd4..3d8f1f1 100644
  
 diff --git a/include/linux/zstd_lib.h b/include/linux/zstd_lib.h
 index 79d5546..199057d 100644
-diff --git a/crypto/zstd.c b/crypto/zstd.c
---- a/crypto/zstd.c	2025-08-31 04:49:22.886976974 +0800
-+++ b/crypto/zstd.c	2025-09-28 23:17:32.392070694 +0800
-@@ -15,7 +15,8 @@
- #include <crypto/internal/scompress.h>
- 
- 
--#define ZSTD_DEF_LEVEL	3
-+static uint __read_mostly compression_level = 1;
-+module_param(compression_level, uint, 0644);
- 
- struct zstd_ctx {
- 	zstd_cctx *cctx;
-@@ -26,7 +27,11 @@
- 
- static zstd_parameters zstd_params(void)
- {
--	return zstd_get_params(ZSTD_DEF_LEVEL, 0);
-+	if (compression_level == 0)
-+		compression_level = 1;
-+	if (compression_level > zstd_max_clevel())
-+		compression_level = zstd_max_clevel();
-+	return zstd_get_params(compression_level, PAGE_SIZE);
- }
- 
- static int zstd_comp_init(struct zstd_ctx *ctx)
 diff --git a/lib/zstd/common/bits.h b/lib/zstd/common/bits.h
 --- /dev/null	1970-01-01 08:00:00.000000000 +0800
 +++ b/lib/zstd/common/bits.h	2025-09-28 23:17:32.384947445 +0800
