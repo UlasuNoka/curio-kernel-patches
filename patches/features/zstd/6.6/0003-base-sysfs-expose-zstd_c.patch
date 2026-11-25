@@ -1,0 +1,50 @@
+diff --git a/drivers/base/core.c b/drivers/base/core.c
+index 6916dc5..e12ebdd 100644
+--- a/drivers/base/core.c
++++ b/drivers/base/core.c
+@@ -2369,6 +2369,25 @@ EXPORT_SYMBOL(dev_driver_string);
+ 
+ #define to_dev_attr(_attr) container_of(_attr, struct device_attribute, attr)
+ 
++#if IS_ENABLED(CONFIG_CRYPTO_ZSTD)
++static bool zram_has_alg_token(const char *buf, const char *alg)
++{
++	size_t len = strlen(alg);
++	const char *p = buf;
++
++	while ((p = strstr(p, alg)) != NULL) {
++		bool left_ok = (p == buf) || (p[-1] == ' ') || (p[-1] == '[');
++		char r = p[len];
++		bool right_ok = (r == '\0') || (r == ' ') || (r == ']') || (r == '\n');
++
++		if (left_ok && right_ok)
++			return true;
++		p += len;
++	}
++	return false;
++}
++#endif
++
+ static ssize_t dev_attr_show(struct kobject *kobj, struct attribute *attr,
+ 			     char *buf)
+ {
+@@ -2378,6 +2397,19 @@ static ssize_t dev_attr_show(struct kobject *kobj, struct attribute *attr,
+ 
+ 	if (dev_attr->show)
+ 		ret = dev_attr->show(dev, dev_attr, buf);
++#if IS_ENABLED(CONFIG_CRYPTO_ZSTD)
++	if (ret > 0 && ret < (ssize_t)PAGE_SIZE - 8 &&
++	    unlikely(!strcmp(attr->name, "comp_algorithm")) &&
++	    kobj->name && !strncmp(kobj->name, "zram", 4)) {
++		buf[ret] = '\0';
++		if (!zram_has_alg_token(buf, "zstd_c")) {
++			if (buf[ret - 1] == '\n')
++				ret--;
++			ret += scnprintf(buf + ret, PAGE_SIZE - ret, "%szstd_c\n",
++					 (ret > 0 && buf[ret - 1] != ' ') ? " " : "");
++		}
++	}
++#endif
+ 	if (ret >= (ssize_t)PAGE_SIZE) {
+ 		printk("dev_attr_show: %pS returned bad count\n",
+ 				dev_attr->show);
