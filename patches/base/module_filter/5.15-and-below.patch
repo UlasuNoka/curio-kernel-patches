@@ -28,7 +28,7 @@ index bcadcef..d30e74c 100644
 +#include <linux/bootconfig.h>
 +#endif
 +
-+extern char *saved_command_line; 
++extern char *saved_command_line;
 +
 +DEFINE_STATIC_KEY_TRUE(vendor_debloat_key);
 +
@@ -56,7 +56,7 @@ index bcadcef..d30e74c 100644
 +	if (mode && (!strcmp(mode, "normal") || !strcmp(mode, "reboot")))
 +		return true;
 +
-+	// Value check skipped as recovery partition is different and boot is diffrent
++	/* Recovery and normal boot handle force_normal_boot differently. */
 +	if (xbc_find_value("androidboot.force_normal_boot", NULL) || strstr(saved_command_line, "androidboot.force_normal_boot"))
 +		return true;
 +
